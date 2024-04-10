@@ -34,17 +34,18 @@ from pydantic.utils import ROOT_KEY, Representation
 from sqlalchemy import Boolean, Column, Date, DateTime
 from sqlalchemy import Enum as sa_Enum
 from sqlalchemy import Float, ForeignKey, Integer, Interval, Numeric, inspect
-from sqlalchemy.orm import RelationshipProperty, declared_attr, registry, relationship
+from sqlalchemy.orm import RelationshipProperty, declared_attr, registry, relationship, ColumnProperty
 from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.decl_api import DeclarativeMeta
 from sqlalchemy.orm.instrumentation import is_instrumented
 from sqlalchemy.sql.schema import MetaData
 from sqlalchemy.sql.sqltypes import LargeBinary, Time
+from sqlalchemy.ext.hybrid import hybrid_property
 
 from .sql.sqltypes import GUID, AutoString
 
 _T = TypeVar("_T")
-
+SQLAlchemyConstruct = Union[hybrid_property, ColumnProperty, declared_attr]
 
 def __dataclass_transform__(
     *,
@@ -207,6 +208,7 @@ def Relationship(
 @__dataclass_transform__(kw_only_default=True, field_descriptors=(Field, FieldInfo))
 class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
     __sqlmodel_relationships__: Dict[str, RelationshipInfo]
+    __sqlalchemy_constructs__: Dict[str, SQLAlchemyConstruct]
     __config__: Type[BaseConfig]
     __fields__: Dict[str, ModelField]
 
@@ -232,6 +234,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         **kwargs: Any,
     ) -> Any:
         relationships: Dict[str, RelationshipInfo] = {}
+        sqlalchemy_constructs: Dict[str, SQLAlchemyConstruct] = {}
         dict_for_pydantic = {}
         original_annotations = resolve_annotations(
             class_dict.get("__annotations__", {}), class_dict.get("__module__", None)
@@ -241,6 +244,8 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         for k, v in class_dict.items():
             if isinstance(v, RelationshipInfo):
                 relationships[k] = v
+            elif isinstance(v, (hybrid_property, ColumnProperty, declared_attr)):
+                sqlalchemy_constructs[k] = v
             else:
                 dict_for_pydantic[k] = v
         for k, v in original_annotations.items():
@@ -253,6 +258,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             "__weakref__": None,
             "__sqlmodel_relationships__": relationships,
             "__annotations__": pydantic_annotations,
+            "__sqlalchemy_constructs__": sqlalchemy_constructs,
         }
         # Duplicate logic from Pydantic to filter config kwargs because if they are
         # passed directly including the registry Pydantic will pass them over to the
@@ -276,6 +282,11 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             **new_cls.__annotations__,
         }
 
+        # We did not provide the sqlalchemy constructs to Pydantic's new function above
+        # so that they wouldn't be modified. Instead we set them directly to the class below:
+        for k, v in sqlalchemy_constructs.items():
+            setattr(new_cls, k, v)
+
         def get_config(name: str) -> Any:
             config_class_value = getattr(new_cls.__config__, name, Undefined)
             if config_class_value is not Undefined:
@@ -290,6 +301,8 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             # If it was passed by kwargs, ensure it's also set in config
             new_cls.__config__.table = config_table
             for k, v in new_cls.__fields__.items():
+                if k in sqlalchemy_constructs:
+                    continue
                 col = get_column_from_field(v)
                 setattr(new_cls, k, col)
             # Set a config flag to tell FastAPI that this should be read with a field
@@ -307,6 +320,8 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             setattr(new_cls, "_sa_registry", config_registry)
             setattr(new_cls, "metadata", config_registry.metadata)
             setattr(new_cls, "__abstract__", True)
+            setattr(new_cls, "__pydantic_private__", {})  # noqa: B010
+            setattr(new_cls, "__pydantic_extra__", {})  # noqa: B010
         return new_cls
 
     # Override SQLAlchemy, allow both SQLAlchemy and plain Pydantic models
@@ -328,6 +343,9 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             for field_name, field_value in cls.__fields__.items():
                 dict_used[field_name] = get_column_from_field(field_value)
             for rel_name, rel_info in cls.__sqlmodel_relationships__.items():
+                if rel_name in cls.__sqlalchemy_constructs__:
+                    # Skip hybrid properties
+                    continue
                 if rel_info.sa_relationship:
                     # There's a SQLAlchemy relationship declared, that takes precedence
                     # over anything else, use that and continue with the next attribute
